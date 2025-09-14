@@ -178,7 +178,8 @@ import { Midi } from "https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/+esm";
       }
       const tasks = [];
       needed.forEach(p => {
-        if (!instruments[p]) {
+        const inst = instruments[p];
+        if (!inst || inst.context !== ctx) {
           const name = programToName(p);
           const fonts = ['MusyngKite', 'FluidR3_GM'];
           const load = (i) => window.Soundfont.instrument(ctx, name, { soundfont: fonts[i] })
@@ -218,7 +219,11 @@ import { Midi } from "https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/+esm";
 
   function stopMidi(){
     if (rafId) cancelAnimationFrame(rafId);
-    if (ac){ try{ ac.close(); }catch(_){} ac = null; }
+    if (ac){
+      try{ ac.close(); }catch(_){}
+      ac = null;
+      for (const k in instruments) delete instruments[k];
+    }
     isPlaying = false; startAt = 0; timeInfo.textContent = '0.000 s';
     playBtn.textContent = '▶︎ Reproducir MIDI';
     clearHighlights();
@@ -366,6 +371,7 @@ import { Midi } from "https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/+esm";
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
     try { ac = new AudioCtx(); } catch(e){ alert('AudioContext no soportado.'); return; }
     if (ac.state === 'suspended') { try { await ac.resume(); } catch(_){} }
+    if (ac.state !== 'running') { alert('No se pudo iniciar el AudioContext.'); return; }
     try {
       await ensureInstruments(ac);
       startAt = ac.currentTime - (tStart || 0);
