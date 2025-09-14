@@ -235,15 +235,14 @@ import { computeNoteLeftPx, buildTempoMap, audioTimeToMs } from './player-utils.
       const inst = instruments[p] || instruments[0];
       const vol = settings.volume != null ? settings.volume : 1;
       if (!inst || !t.notes) return;
-      const events = [];
       t.notes.forEach(n => {
         if (n.time < offset) return; // omitir notas previas
-        const tRel = (n.time - offset) / tempoScale + delay;
+        const when = ctx.currentTime + ((n.time - offset) / tempoScale) + delay;
         const dur = Math.max(0.04, n.duration / tempoScale);
         const vel = Math.max(0, Math.min(1, (n.velocity || 0.8) * vol));
-        events.push({ time: tRel, midi: n.midi, gain: vel, duration: dur });
+        const noteId = n.name || n.midi;
+        try { inst.play(noteId, when, { gain: vel, duration: dur }); } catch(_){ }
       });
-      if (events.length) inst.schedule(ctx.currentTime, events);
     });
   }
 
