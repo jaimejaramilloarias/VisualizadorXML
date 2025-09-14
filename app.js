@@ -243,7 +243,7 @@ import { computeNoteLeftPx, buildTempoMap, audioTimeToMs } from './player-utils.
         const vel = Math.max(0, Math.min(1, (n.velocity || 0.8) * vol));
         events.push({ time: tRel, midi: n.midi, gain: vel, duration: dur });
       });
-      if (events.length) inst.schedule(start, events);
+      if (events.length) inst.schedule(ctx.currentTime, events);
     });
   }
 
