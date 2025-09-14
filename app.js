@@ -1,5 +1,5 @@
 import { Midi } from "https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/+esm";
-import { computeNoteLeftPx } from './player-utils.js';
+import { computeNoteLeftPx, buildTempoMap, audioTimeToMs } from './player-utils.js';
 
 (function(){
   'use strict';
@@ -13,6 +13,8 @@ import { computeNoteLeftPx } from './player-utils.js';
   const zoomRange = document.getElementById('zoom');
   const zoomVal = document.getElementById('zoomVal');
   const followChk = document.getElementById('follow');
+  const tempoRange = document.getElementById('tempo');
+  const tempoVal = document.getElementById('tempoVal');
   const pageInfo = document.getElementById('pageInfo');
   const timeInfo = document.getElementById('timeInfo');
   const vrvVersion = document.getElementById('vrvVersion');
@@ -37,6 +39,8 @@ import { computeNoteLeftPx } from './player-utils.js';
   let isPlaying = false;         // reproduciendo
   let startAt = 0;               // ac.currentTime cuando inicia
   let prevNoteIds = new Set();   // notas resaltadas actuales
+  let tempoScale = 1;            // escala global de tempo (1 = 100%)
+  let preloadAc = null;          // AudioContext precargado
 
   // Playhead overlay
   const playhead = document.createElement('div');
@@ -132,28 +136,6 @@ import { computeNoteLeftPx } from './player-utils.js';
   ];
   function programToName(p){ return GM_NAMES[p|0] || 'acoustic_grand_piano'; }
 
-  function buildTempoMap(m){
-    tempoEvents = [];
-    if (!m || !m.header || !m.header.tempos) return;
-    const tempos = m.header.tempos;
-    tempos.forEach(ev => {
-      const t = (ev.time != null) ? ev.time : (ev.ticks / m.header.ppq) * (60 / ev.bpm);
-      tempoEvents.push({ time: t, ms: t * 1000, bpm: ev.bpm });
-    });
-  }
-
-  function audioTimeToMs(sec){
-    if (!tempoEvents.length) return sec * 1000;
-    let prev = tempoEvents[0];
-    for (let i = 1; i < tempoEvents.length; i++) {
-      const next = tempoEvents[i];
-      if (sec < next.time) {
-        return prev.ms + (sec - prev.time) * 1000;
-      }
-      prev = next;
-    }
-    return prev.ms + (sec - prev.time) * 1000;
-  }
 
   async function ensureMidiParsed(){
     if (!vrv) throw new Error('Verovio no está listo');
@@ -162,9 +144,9 @@ import { computeNoteLeftPx } from './player-utils.js';
     const ab = a.buffer;
     if (typeof Midi.fromArrayBuffer === 'function') {
       const m = await Midi.fromArrayBuffer(ab);
-      midiObj = m; midiDuration = m.duration || 0; buildTempoMap(m); return;
+      midiObj = m; midiDuration = m.duration || 0; tempoEvents = buildTempoMap(m); return;
     }
-    midiObj = new Midi(ab); midiDuration = midiObj.duration || 0; buildTempoMap(midiObj);
+    midiObj = new Midi(ab); midiDuration = midiObj.duration || 0; tempoEvents = buildTempoMap(midiObj);
   }
 
   function buildTrackControls(){
@@ -230,6 +212,17 @@ import { computeNoteLeftPx } from './player-utils.js';
     });
   }
 
+  function preloadInstruments(){
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx || preloadAc) return;
+    try {
+      preloadAc = new AudioCtx();
+      ensureInstruments(preloadAc).catch(()=>{});
+    } catch (_) {
+      preloadAc = null;
+    }
+  }
+
   function scheduleAll(ctx, start){
     const delay = 0.05; // s
     if (!midiObj || !midiObj.tracks) return;
@@ -242,8 +235,8 @@ import { computeNoteLeftPx } from './player-utils.js';
       const vol = settings.volume != null ? settings.volume : 1;
       if (!inst || !t.notes) return;
       t.notes.forEach(n => {
-        const when = start + delay + n.time;
-        const dur = Math.max(0.04, n.duration);
+        const when = start + delay + (n.time / tempoScale);
+        const dur = Math.max(0.04, n.duration / tempoScale);
         const vel = Math.max(0, Math.min(1, (n.velocity||0.8) * vol));
         try { inst.play(n.midi, when, { duration: dur, gain: vel }); } catch(_){}
       });
@@ -292,6 +285,7 @@ import { computeNoteLeftPx } from './player-utils.js';
       if (!scoreEl.querySelector('svg')) { vrv.setOptions({ breaks: 'auto' }); vrv.redoLayout(); renderPage(1); }
       await ensureMidiParsed();
       buildTrackControls();
+      preloadInstruments();
       playBtn.disabled = false; stopBtn.disabled = false;
     } catch (e) {
       console.error(e); alert('No se pudo cargar la partitura: ' + (e.message||e));
@@ -302,8 +296,8 @@ import { computeNoteLeftPx } from './player-utils.js';
   function loop(){
     if (isPlaying && ac){
       const offsetMs = Number(offsetNum.value) || 0;
-      const curSec = ac.currentTime - startAt;
-      const t = Math.max(0, audioTimeToMs(curSec) + offsetMs);
+      const curSec = (ac.currentTime - startAt) * tempoScale;
+      const t = Math.max(0, audioTimeToMs(tempoEvents, curSec) + offsetMs);
       timeInfo.textContent = (t/1000).toFixed(3) + ' s';
       const elems = vrv.getElementsAtTime(Math.floor(t));
       if (elems && elems.page && elems.page !== page && followChk.checked) renderPage(elems.page);
@@ -335,7 +329,7 @@ import { computeNoteLeftPx } from './player-utils.js';
           }
         }
       }
-      if ((ac.currentTime - startAt) >= (midiDuration + 0.5)) { stopMidi(); return; }
+      if ((ac.currentTime - startAt) >= ((midiDuration / tempoScale) + 0.5)) { stopMidi(); return; }
       rafId = requestAnimationFrame(loop);
     }
   }
@@ -370,6 +364,22 @@ import { computeNoteLeftPx } from './player-utils.js';
   zoomRange.addEventListener('input', applyZoom);
   window.addEventListener('resize', () => { setOptionsForContainer(); if (vrv) { vrv.redoLayout(); renderPage(page); } });
 
+  function applyTempo(){
+    const val = Number(tempoRange.value);
+    const newScale = val / 100;
+    tempoVal.textContent = val + '%';
+    if (newScale === tempoScale) return;
+    if (isPlaying && ac){
+      const pos = (ac.currentTime - startAt) * tempoScale;
+      stopMidi();
+      tempoScale = newScale;
+      playMidiAt(pos);
+    } else {
+      tempoScale = newScale;
+    }
+  }
+  tempoRange.addEventListener('input', applyTempo);
+
   tapAlignBtn.addEventListener('click', () => {
     alignByClick = !alignByClick;
     tapAlignBtn.classList.toggle('danger', alignByClick);
@@ -403,12 +413,12 @@ import { computeNoteLeftPx } from './player-utils.js';
   async function playMidiAt(tStart){
     if (!midiObj) { alert('MIDI aún no está listo. Carga una partitura primero.'); return; }
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
-    try { ac = new AudioCtx(); } catch(e){ alert('AudioContext no soportado.'); return; }
+    try { ac = preloadAc || new AudioCtx(); preloadAc = null; } catch(e){ alert('AudioContext no soportado.'); return; }
     if (ac.state === 'suspended') { try { await ac.resume(); } catch(_){} }
     if (ac.state !== 'running') { alert('No se pudo iniciar el AudioContext.'); return; }
     try {
       await ensureInstruments(ac);
-      startAt = ac.currentTime - (tStart || 0);
+      startAt = ac.currentTime - ((tStart || 0) / tempoScale);
       isPlaying = true; playBtn.textContent = '⏸ Parar (MIDI)';
       scheduleAll(ac, startAt);
       rafId = requestAnimationFrame(loop);
