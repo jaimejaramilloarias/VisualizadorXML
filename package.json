@@ -1,0 +1,18 @@
+{
+  "name": "visualizadorxml",
+  "version": "1.0.0",
+  "description": "",
+  "type": "module",
+  "main": "app.js",
+  "scripts": {
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@tonejs/midi": "^2.0.28",
+    "jest": "^29.7.0",
+    "jsdom": "^22.1.0"
+  }
+}

@@ -1,4 +1,5 @@
 import { Midi } from "https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/+esm";
+import { computeNoteLeftPx } from './player-utils.js';
 
 (function(){
   'use strict';
@@ -16,6 +17,7 @@ import { Midi } from "https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/+esm";
   const timeInfo = document.getElementById('timeInfo');
   const vrvVersion = document.getElementById('vrvVersion');
   const tapAlignBtn = document.getElementById('tapAlignBtn');
+  const trackControls = document.getElementById('trackControls');
 
   // ===== State =====
   let vrv = null;             // Verovio toolkit
@@ -30,6 +32,7 @@ import { Midi } from "https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/+esm";
   let midiDuration = 0;          // segundos
   let tempoEvents = [];          // mapa de tempo (segundos)
   const instruments = {};        // program -> soundfont instrument
+  const trackSettings = [];      // config de pista
   let notePositions = {};        // cache de posiciones X por id
   let isPlaying = false;         // reproduciendo
   let startAt = 0;               // ac.currentTime cuando inicia
@@ -164,14 +167,50 @@ import { Midi } from "https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/+esm";
     midiObj = new Midi(ab); midiDuration = midiObj.duration || 0; buildTempoMap(midiObj);
   }
 
+  function buildTrackControls(){
+    if (!trackControls) return;
+    trackControls.innerHTML = '';
+    trackSettings.length = 0;
+    if (!midiObj || !midiObj.tracks) return;
+    midiObj.tracks.forEach((t, i) => {
+      if (!t.notes || !t.notes.length) return;
+      const isDrums = (t.channel === 9);
+      const program = isDrums ? 118 : ((t.instrument && Number.isFinite(t.instrument.number)) ? t.instrument.number : 0);
+      trackSettings[i] = { program, volume: 1 };
+      const wrap = document.createElement('div');
+      wrap.className = 'track-control';
+      const label = document.createElement('span');
+      label.textContent = 'Pista ' + (i + 1);
+      wrap.appendChild(label);
+      const sel = document.createElement('select');
+      GM_NAMES.forEach((name, idx) => {
+        const opt = document.createElement('option');
+        opt.value = idx; opt.textContent = name.replace(/_/g, ' ');
+        if (idx === program) opt.selected = true;
+        sel.appendChild(opt);
+      });
+      sel.addEventListener('change', () => { trackSettings[i].program = Number(sel.value); });
+      wrap.appendChild(sel);
+      const vol = document.createElement('input');
+      vol.type = 'range'; vol.min = 0; vol.max = 1; vol.step = 0.01; vol.value = 1;
+      vol.addEventListener('input', () => { trackSettings[i].volume = Number(vol.value); });
+      wrap.appendChild(vol);
+      trackControls.appendChild(wrap);
+    });
+  }
+
   function ensureInstruments(ctx){
     return ensureSoundfontLoaded().then(() => {
       const needed = new Set();
       if (midiObj && midiObj.tracks) {
-        midiObj.tracks.forEach(t => {
+        midiObj.tracks.forEach((t, i) => {
           if (t.notes && t.notes.length){
             const isDrums = (t.channel === 9);
-            const p = isDrums ? 118 /*synth_drum*/ : ((t.instrument && Number.isFinite(t.instrument.number)) ? t.instrument.number : 0);
+            const settings = trackSettings[i];
+            const p = settings && settings.program != null
+              ? settings.program
+              : isDrums ? 118 /*synth_drum*/
+                : ((t.instrument && Number.isFinite(t.instrument.number)) ? t.instrument.number : 0);
             needed.add(p);
           }
         });
@@ -194,15 +233,18 @@ import { Midi } from "https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/+esm";
   function scheduleAll(ctx, start){
     const delay = 0.05; // s
     if (!midiObj || !midiObj.tracks) return;
-    midiObj.tracks.forEach(t => {
+    midiObj.tracks.forEach((t, i) => {
       const isDrums = (t.channel === 9);
-      const p = isDrums ? 118 : ((t.instrument && Number.isFinite(t.instrument.number)) ? t.instrument.number : 0);
+      const settings = trackSettings[i] || {};
+      const p = settings.program != null ? settings.program
+        : isDrums ? 118 : ((t.instrument && Number.isFinite(t.instrument.number)) ? t.instrument.number : 0);
       const inst = instruments[p] || instruments[0];
+      const vol = settings.volume != null ? settings.volume : 1;
       if (!inst || !t.notes) return;
       t.notes.forEach(n => {
         const when = start + delay + n.time;
         const dur = Math.max(0.04, n.duration);
-        const vel = Math.max(0, Math.min(1, n.velocity||0.8));
+        const vel = Math.max(0, Math.min(1, (n.velocity||0.8) * vol));
         try { inst.play(n.midi, when, { duration: dur, gain: vel }); } catch(_){}
       });
     });
@@ -249,6 +291,7 @@ import { Midi } from "https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/+esm";
       renderPage(1);
       if (!scoreEl.querySelector('svg')) { vrv.setOptions({ breaks: 'auto' }); vrv.redoLayout(); renderPage(1); }
       await ensureMidiParsed();
+      buildTrackControls();
       playBtn.disabled = false; stopBtn.disabled = false;
     } catch (e) {
       console.error(e); alert('No se pudo cargar la partitura: ' + (e.message||e));
@@ -282,16 +325,7 @@ import { Midi } from "https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/+esm";
       prevNoteIds = noteIds;
       const noteId = elems && elems.notes && elems.notes[0];
       if (noteId && svg) {
-        let leftPx = notePositions[noteId];
-        if (leftPx === undefined) {
-          const target = svg.getElementById(noteId);
-          if (target) {
-            const box = target.getBBox();
-            const vb = svg.viewBox.baseVal; const pxPerUnit = svg.clientWidth / vb.width;
-            leftPx = Math.round(box.x * pxPerUnit) + 16;
-            notePositions[noteId] = leftPx;
-          }
-        }
+        const leftPx = computeNoteLeftPx(noteId, svg, notePositions);
         if (leftPx !== undefined) {
           playhead.style.left = leftPx + 'px';
           if (followChk.checked) {
