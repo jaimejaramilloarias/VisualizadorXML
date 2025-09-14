@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Verovio + Playhead + Reproducción MIDI</title>
+  <!-- Verovio (WASM global) -->
+  <script src="https://www.verovio.org/javascript/latest/verovio-toolkit-wasm.js" defer></script>
+  <!-- soundfont-player (v0.12.0). Si el CDN falla, el runtime intentará otros mirrors -->
+  <script src="https://cdn.jsdelivr.net/npm/soundfont-player@0.12.0/dist/soundfont-player.min.js" defer></script>
+  <style>
+    :root{ --bg:#0b0e14; --fg:#e6e6e6; --muted:#9aa4ad; --panel:#121621; --panel2:#171b27; --brand:#3b82f6; --danger:#ef4444; }
+    html,body{height:100%}
+    body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,Segoe UI,Roboto,Arial}
+    .app{display:grid;grid-template-rows:auto 1fr auto;min-height:100%}
+    header{position:sticky;top:0;z-index:20;background:linear-gradient(180deg,var(--panel),var(--panel2));border-bottom:1px solid #1d2232;padding:.6rem .9rem;display:flex;gap:.6rem;flex-wrap:wrap;align-items:center}
+    header .group{display:flex;gap:.5rem;align-items:center;background:#0e1320;padding:.5rem .6rem;border-radius:12px;border:1px solid #1f2433}
+    header label{font-size:.8rem;color:var(--muted)}
+    input[type="file"]{color:var(--fg)}
+    input[type="range"]{accent-color:var(--brand)}
+    input[type="number"]{font:inherit}
+    button{background:#1b2030;color:var(--fg);border:1px solid #2a3147;border-radius:10px;padding:.45rem .7rem;cursor:pointer}
+    button.primary{background:var(--brand);color:#060a16;border-color:#3b1a9b;font-weight:600}
+    button.danger{background:var(--danger);color:#2b0a0a;border-color:#7a2323}
+    #score-wrap{position:relative;overflow-x:auto;overflow-y:hidden;background:#ffffff;border-top:1px solid #e5e7eb;border-bottom:1px solid #e5e7eb}
+    #score{position:relative; padding:1rem; min-height:60vh;}
+    /* Canvas de partitura claro y horizontal */
+    #score svg{height:72vh; width:auto; display:block; background:#ffffff; max-width:none !important}
+    .playhead{position:absolute;top:1rem;bottom:1rem;width:2px;background:#e11d48;pointer-events:none;box-shadow:0 0 0 1px rgba(255,0,0,.15)}
+    footer{padding:.6rem .9rem;color:var(--muted);display:flex;justify-content:space-between;align-items:center;border-top:1px solid #222;background:#0b0f19}
+    .pill{background:#10172a;border:1px solid #1f2740;padding:.25rem .5rem;border-radius:999px}
+  </style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="group">
+      <label for="scoreFile">Partitura</label>
+      <input id="scoreFile" type="file" accept=".mei,.xml,.musicxml,.mxl,.zip" />
+    </div>
+    <div class="group">
+      <button id="playBtn" class="primary" disabled>▶︎ Reproducir MIDI</button>
+      <button id="stopBtn" disabled>■</button>
+    </div>
+    <div class="group">
+      <label for="offset">Offset (ms)</label>
+      <input id="offset" type="number" step="1" value="0" style="width:6rem" />
+      <input id="offsetRange" type="range" min="-4000" max="4000" step="1" value="0" />
+      <button id="tapAlignBtn" title="Haz clic en una nota para alinear offset">Alinear por clic</button>
+    </div>
+    <div class="group">
+      <label for="zoom">Zoom</label>
+      <input id="zoom" type="range" min="30" max="160" value="100" />
+      <span id="zoomVal" class="pill">100%</span>
+      <label style="margin-left:.5rem"><input id="follow" type="checkbox" checked /> Seguir página</label>
+    </div>
+    <div class="group">
+      <span class="pill" id="pageInfo">Pág. –/–</span>
+      <span class="pill" id="timeInfo">0.000 s</span>
+    </div>
+  </header>
+
+  <div id="score-wrap">
+    <div id="score"></div>
+  </div>
+
+  <footer>
+    <div>Verovio + MIDI (SoundFont) — tira horizontal con playhead y autoscroll.</div>
+    <div id="vrvVersion" class="pill">Cargando Verovio…</div>
+  </footer>
+</div>
+
+<!-- Script principal como módulo -->
+<script type="module">
+import { Midi } from "https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/+esm";
+
+(function(){
+  'use strict';
+  // ===== UI refs =====
+  const scoreEl = document.getElementById('score');
+  const scoreFile = document.getElementById('scoreFile');
+  const playBtn = document.getElementById('playBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const offsetNum = document.getElementById('offset');
+  const offsetRange = document.getElementById('offsetRange');
+  const zoomRange = document.getElementById('zoom');
+  const zoomVal = document.getElementById('zoomVal');
+  const followChk = document.getElementById('follow');
+  const pageInfo = document.getElementById('pageInfo');
+  const timeInfo = document.getElementById('timeInfo');
+  const vrvVersion = document.getElementById('vrvVersion');
+  const tapAlignBtn = document.getElementById('tapAlignBtn');
+
+  // ===== State =====
+  let vrv = null;             // Verovio toolkit
+  let vrvReady = false;       // toolkit listo
+  let pendingScoreFile = null;// archivo seleccionado antes de init
+  let page = 1, pageCount = 0;
+  let rafId = null;
+  let alignByClick = false;
+  // MIDI state
+  let ac = null;                 // AudioContext
+  let midiObj = null;            // @tonejs/midi
+  let midiDuration = 0;          // segundos
+  const instruments = {};        // program -> soundfont instrument
+  let isPlaying = false;         // reproduciendo
+  let startAt = 0;               // ac.currentTime cuando inicia
+
+  // Playhead overlay
+  const playhead = document.createElement('div');
+  playhead.className = 'playhead';
+  scoreEl.appendChild(playhead);
+
+  // ===== Helpers =====
+  function updateVersionLabel(){
+    try { vrvVersion.textContent = vrv ? ('Verovio v' + vrv.getVersion()) : 'Verovio'; }
+    catch(_) { vrvVersion.textContent = 'Verovio'; }
+  }
+
+  function setOptionsForContainer(scalePct){
+    if (!vrv) return;
+    const scale = Number(scalePct != null ? scalePct : zoomRange.value);
+    vrv.setOptions({
+      breaks: 'none',           // tira horizontal
+      svgViewBox: true,
+      scaleToPageSize: false,
+      adjustPageHeight: false,
+      adjustPageWidth: false,
+      scale: scale,
+      svgBoundingBoxes: true
+    });
+  }
+
+  function renderPage(n){
+    if (!vrv) return;
+    page = Math.max(1, Math.min(n != null ? n : page, pageCount || 1));
+    const svg = vrv.renderToSVG(page, false);
+    scoreEl.innerHTML = svg;
+    scoreEl.appendChild(playhead);
+    pageInfo.textContent = 'Pág. ' + page + '/' + (pageCount || '–');
+    const wrap = document.getElementById('score-wrap');
+    wrap.scrollLeft = 0;
+  }
+
+  function b64ToArrayBuffer(b64){
+    const bin = atob(b64); const len = bin.length; const bytes = new Uint8Array(len);
+    for (let i=0;i<len;i++) bytes[i] = bin.charCodeAt(i);
+    return bytes.buffer;
+  }
+
+  // ===== soundfont-player loader robusto =====
+  function ensureSoundfontLoaded(){
+    return new Promise((resolve, reject) => {
+      if (window.Soundfont) { resolve(); return; }
+      const sources = [
+        'https://cdn.jsdelivr.net/npm/soundfont-player@0.12.0/dist/soundfont-player.min.js',
+        'https://cdn.jsdelivr.net/npm/soundfont-player@0.12.0/dist/soundfont-player.js',
+        'https://cdn.jsdelivr.net/gh/danigb/soundfont-player@0.12.0/dist/soundfont-player.min.js',
+        'https://danigb.github.io/soundfont-player/soundfont-player.min.js'
+      ];
+      const tryNext = (i) => {
+        if (i >= sources.length) { reject(new Error('soundfont-player no cargó')); return; }
+        const s = document.createElement('script');
+        s.src = sources[i]; s.async = true; s.crossOrigin = 'anonymous';
+        s.onload = () => resolve();
+        s.onerror = () => tryNext(i+1);
+        document.head.appendChild(s);
+      };
+      tryNext(0);
+      setTimeout(() => { if (!window.Soundfont) reject(new Error('soundfont-player no cargó (timeout)')); }, 20000);
+    });
+  }
+
+  // ===== MIDI helpers =====
+  const GM_NAMES = [
+    'acoustic_grand_piano','bright_acoustic_piano','electric_grand_piano','honkytonk_piano','electric_piano_1','electric_piano_2','harpsichord','clavinet',
+    'celesta','glockenspiel','music_box','vibraphone','marimba','xylophone','tubular_bells','dulcimer',
+    'drawbar_organ','percussive_organ','rock_organ','church_organ','reed_organ','accordion','harmonica','tango_accordion',
+    'acoustic_guitar_nylon','acoustic_guitar_steel','electric_guitar_jazz','electric_guitar_clean','electric_guitar_muted','overdriven_guitar','distortion_guitar','guitar_harmonics',
+    'acoustic_bass','electric_bass_finger','electric_bass_pick','fretless_bass','slap_bass_1','slap_bass_2','synth_bass_1','synth_bass_2',
+    'violin','viola','cello','contrabass','tremolo_strings','pizzicato_strings','orchestral_harp','timpani',
+    'string_ensemble_1','string_ensemble_2','synth_strings_1','synth_strings_2','choir_aahs','voice_oohs','synth_choir','orchestra_hit',
+    'trumpet','trombone','tuba','muted_trumpet','french_horn','brass_section','synth_brass_1','synth_brass_2',
+    'soprano_sax','alto_sax','tenor_sax','baritone_sax','oboe','english_horn','bassoon','clarinet',
+    'piccolo','flute','recorder','pan_flute','blown_bottle','shakuhachi','whistle','ocarina',
+    'lead_1_square','lead_2_sawtooth','lead_3_calliope','lead_4_chiff','lead_5_charang','lead_6_voice','lead_7_fifths','lead_8_bass__lead',
+    'pad_1_new_age','pad_2_warm','pad_3_polysynth','pad_4_choir','pad_5_bowed','pad_6_metallic','pad_7_halo','pad_8_sweep',
+    'fx_1_rain','fx_2_soundtrack','fx_3_crystal','fx_4_atmosphere','fx_5_brightness','fx_6_goblins','fx_7_echoes','fx_8_scifi',
+    'sitar','banjo','shamisen','koto','kalimba','bagpipe','fiddle','shanai',
+    'tinkle_bell','agogo','steel_drums','woodblock','taiko_drum','melodic_tom','synth_drum','reverse_cymbal',
+    'guitar_fret_noise','breath_noise','seashore','bird_tweet','telephone_ring','helicopter','applause','gunshot'
+  ];
+  function programToName(p){ return GM_NAMES[p|0] || 'acoustic_grand_piano'; }
+
+  async function ensureMidiParsed(){
+    if (!vrv) throw new Error('Verovio no está listo');
+    const b64 = vrv.renderToMIDI();
+    const bin = atob(b64); const a = new Uint8Array(bin.length); for (let i=0;i<bin.length;i++) a[i] = bin.charCodeAt(i);
+    const ab = a.buffer;
+    if (typeof Midi.fromArrayBuffer === 'function') {
+      const m = await Midi.fromArrayBuffer(ab);
+      midiObj = m; midiDuration = m.duration || 0; return;
+    }
+    midiObj = new Midi(ab); midiDuration = midiObj.duration || 0;
+  }
+
+  function ensureInstruments(ctx){
+    return ensureSoundfontLoaded().then(() => {
+      const needed = new Set();
+      if (midiObj && midiObj.tracks) {
+        midiObj.tracks.forEach(t => {
+          if (t.notes && t.notes.length){
+            const isDrums = (t.channel === 9);
+            const p = isDrums ? 118 /*synth_drum*/ : ((t.instrument && Number.isFinite(t.instrument.number)) ? t.instrument.number : 0);
+            needed.add(p);
+          }
+        });
+      }
+      const tasks = [];
+      needed.forEach(p => {
+        if (!instruments[p]) {
+          const name = programToName(p);
+          tasks.push(window.Soundfont.instrument(ctx, name, { soundfont: 'FluidR3_GM' }).then(inst => { instruments[p] = inst; }));
+        }
+      });
+      return Promise.all(tasks);
+    });
+  }
+
+  function scheduleAll(ctx, start){
+    const delay = 0.05; // s
+    if (!midiObj || !midiObj.tracks) return;
+    midiObj.tracks.forEach(t => {
+      const isDrums = (t.channel === 9);
+      const p = isDrums ? 118 : ((t.instrument && Number.isFinite(t.instrument.number)) ? t.instrument.number : 0);
+      const inst = instruments[p] || instruments[0];
+      if (!inst || !t.notes) return;
+      t.notes.forEach(n => {
+        const when = start + delay + n.time;
+        const dur = Math.max(0.04, n.duration);
+        const vel = Math.max(0, Math.min(1, n.velocity||0.8));
+        try { inst.play(n.midi, when, { duration: dur, gain: vel }); } catch(_){}
+      });
+    });
+  }
+
+  function stopMidi(){
+    if (rafId) cancelAnimationFrame(rafId);
+    if (ac){ try{ ac.close(); }catch(_){} ac = null; }
+    isPlaying = false; startAt = 0; timeInfo.textContent = '0.000 s';
+    playBtn.textContent = '▶︎ Reproducir MIDI';
+  }
+
+  // ===== Load score =====
+  async function loadScoreFile(file){
+    if (!vrvReady || !vrv) { pendingScoreFile = file; return; }
+    const ext = file.name.toLowerCase();
+    setOptionsForContainer();
+    try {
+      let ok = false;
+      if (ext.endsWith('.mxl') || ext.endsWith('.zip')) {
+        const buf = await file.arrayBuffer();
+        ok = vrv.loadZipDataBuffer(buf);
+      } else {
+        const txt = await file.text();
+        ok = vrv.loadData(txt);
+      }
+      if (ok === false) throw new Error('El archivo no pudo cargarse (formato no reconocido por Verovio).');
+      try { vrv.redoLayout(); } catch(_){}
+      pageCount = Math.max(1, vrv.getPageCount()|0);
+      renderPage(1);
+      if (!scoreEl.querySelector('svg')) { vrv.setOptions({ breaks: 'auto' }); vrv.redoLayout(); renderPage(1); }
+      await ensureMidiParsed();
+      playBtn.disabled = false; stopBtn.disabled = false;
+    } catch (e) {
+      console.error(e); alert('No se pudo cargar la partitura: ' + (e.message||e));
+    }
+  }
+
+  // ===== Loop (playhead + autoscroll) =====
+  function loop(){
+    if (isPlaying && ac){
+      const offsetMs = Number(offsetNum.value) || 0;
+      const t = Math.max(0, (ac.currentTime - startAt) * 1000 + offsetMs);
+      timeInfo.textContent = (t/1000).toFixed(3) + ' s';
+      const elems = vrv.getElementsAtTime(Math.floor(t));
+      if (elems && elems.page && elems.page !== page && followChk.checked) renderPage(elems.page);
+      const svg = scoreEl.querySelector('svg');
+      const noteId = elems && elems.notes && elems.notes[0];
+      if (noteId && svg) {
+        const target = svg.getElementById(noteId);
+        if (target) {
+          const box = target.getBBox();
+          const vb = svg.viewBox.baseVal; const pxPerUnit = svg.clientWidth / vb.width;
+          const leftPx = Math.round(box.x * pxPerUnit) + 16;
+          playhead.style.left = leftPx + 'px';
+          if (followChk.checked) {
+            const wrap = document.getElementById('score-wrap');
+            const want = Math.max(0, leftPx - wrap.clientWidth * 0.4);
+            if (Math.abs(want - wrap.scrollLeft) > 24) wrap.scrollLeft = want;
+          }
+        }
+      }
+      if ((ac.currentTime - startAt) >= (midiDuration + 0.5)) { stopMidi(); return; }
+      rafId = requestAnimationFrame(loop);
+    }
+  }
+
+  // ===== UI events =====
+  scoreEl.addEventListener('click', function(e){
+    const svg = scoreEl.querySelector('svg'); if (!svg || !vrv) return;
+    let el = e.target; while (el && el !== svg && !el.id) el = el.parentNode;
+    if (!el || !el.id) return; const id = el.id;
+    const ms = Math.max(0, Math.floor(vrv.getTimeForElement(id)));
+    const s = ms / 1000;
+    if (isPlaying && ac) { stopMidi(); playMidiAt(s); }
+  });
+
+  scoreFile.addEventListener('change', () => {
+    const f = scoreFile.files && scoreFile.files[0];
+    if (!f) return;
+    if (!vrvReady || !vrv) { pendingScoreFile = f; }
+    else { loadScoreFile(f); }
+  });
+
+  function syncOffset(fromRange){ if (fromRange){ offsetNum.value = offsetRange.value; } else { offsetRange.value = offsetNum.value; } }
+  offsetRange.addEventListener('input', () => syncOffset(true));
+  offsetNum.addEventListener('input', () => syncOffset(false));
+
+  function applyZoom(){
+    const val = Number(zoomRange.value);
+    zoomVal.textContent = val + '%';
+    setOptionsForContainer(val);
+    if (vrv) { vrv.redoLayout(); renderPage(page); }
+  }
+  zoomRange.addEventListener('input', applyZoom);
+  window.addEventListener('resize', () => { setOptionsForContainer(); if (vrv) { vrv.redoLayout(); renderPage(page); } });
+
+  tapAlignBtn.addEventListener('click', () => {
+    alignByClick = !alignByClick;
+    tapAlignBtn.classList.toggle('danger', alignByClick);
+    tapAlignBtn.textContent = alignByClick ? 'Haz clic en una nota…' : 'Alinear por clic';
+  });
+
+  // ===== Verovio init =====
+  function initVerovio(){
+    function doInit(){
+      try {
+        vrv = new verovio.toolkit();
+        vrvReady = true; updateVersionLabel();
+        if (pendingScoreFile) { const f = pendingScoreFile; pendingScoreFile = null; loadScoreFile(f); }
+      } catch(e) {
+        setTimeout(tryInit, 20);
+      }
+    }
+    function tryInit(){
+      if (window.verovio && verovio.module) {
+        try { verovio.module.print = function(){}; verovio.module.printErr = function(){}; } catch(_){}
+        const mod = verovio.module;
+        if (mod.calledRun || mod._malloc) { doInit(); }
+        else { mod.onRuntimeInitialized = doInit; }
+        return true;
+      }
+      return false;
+    }
+    if (!tryInit()) { const timer = setInterval(function(){ if (tryInit()) clearInterval(timer); }, 20); }
+  }
+
+  async function playMidiAt(tStart){
+    if (!midiObj) { alert('MIDI aún no está listo. Carga una partitura primero.'); return; }
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    try { ac = new AudioCtx(); } catch(e){ alert('AudioContext no soportado.'); return; }
+    if (ac.state === 'suspended') { try { await ac.resume(); } catch(_){} }
+    try {
+      await ensureInstruments(ac);
+      startAt = ac.currentTime - (tStart || 0);
+      isPlaying = true; playBtn.textContent = '⏸ Parar (MIDI)';
+      scheduleAll(ac, startAt);
+      rafId = requestAnimationFrame(loop);
+    } catch(e) {
+      console.error(e); alert('No se pudieron cargar instrumentos: ' + (e.message||e));
+    }
+  }
+
+  playBtn.addEventListener('click', () => { if (!isPlaying) playMidiAt(0); else stopMidi(); });
+  stopBtn.addEventListener('click', stopMidi);
+
+  // Go!
+  initVerovio();
+})();
+</script>
+</body>
+</html>
