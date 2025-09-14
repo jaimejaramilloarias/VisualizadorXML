@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Verovio + Playhead + Reproducción MIDI</title>
+  <link rel="icon" type="image/x-icon" href="favicon.ico" />
   <!-- Verovio (WASM global) -->
   <script src="https://www.verovio.org/javascript/latest/verovio-toolkit-wasm.js" defer></script>
   <!-- soundfont-player (v0.12.0). Si el CDN falla, el runtime intentará otros mirrors -->
@@ -32,6 +33,11 @@
       <input id="zoom" type="range" min="30" max="160" value="100" />
       <span id="zoomVal" class="pill">100%</span>
       <label style="margin-left:.5rem"><input id="follow" type="checkbox" checked /> Seguir página</label>
+    </div>
+    <div class="group">
+      <label for="tempo">Tempo</label>
+      <input id="tempo" type="range" min="50" max="150" value="100" />
+      <span id="tempoVal" class="pill">100%</span>
     </div>
     <div class="group">
       <span class="pill" id="pageInfo">Pág. –/–</span>
