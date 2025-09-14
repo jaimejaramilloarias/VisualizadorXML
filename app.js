@@ -226,6 +226,7 @@ import { computeNoteLeftPx, buildTempoMap, audioTimeToMs } from './player-utils.
   function scheduleAll(ctx, start){
     const delay = 0.05; // s
     if (!midiObj || !midiObj.tracks) return;
+    const offset = (ctx.currentTime - start) * tempoScale; // segundos ya reproducidos
     midiObj.tracks.forEach((t, i) => {
       const isDrums = (t.channel === 9);
       const settings = trackSettings[i] || {};
@@ -234,12 +235,15 @@ import { computeNoteLeftPx, buildTempoMap, audioTimeToMs } from './player-utils.
       const inst = instruments[p] || instruments[0];
       const vol = settings.volume != null ? settings.volume : 1;
       if (!inst || !t.notes) return;
+      const events = [];
       t.notes.forEach(n => {
-        const when = start + delay + (n.time / tempoScale);
+        if (n.time < offset) return; // omitir notas previas
+        const tRel = (n.time - offset) / tempoScale + delay;
         const dur = Math.max(0.04, n.duration / tempoScale);
-        const vel = Math.max(0, Math.min(1, (n.velocity||0.8) * vol));
-        try { inst.play(n.midi, when, { duration: dur, gain: vel }); } catch(_){}
+        const vel = Math.max(0, Math.min(1, (n.velocity || 0.8) * vol));
+        events.push({ time: tRel, midi: n.midi, gain: vel, duration: dur });
       });
+      if (events.length) inst.schedule(start, events);
     });
   }
 
