@@ -1,5 +1,5 @@
 import { Midi } from "https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/+esm";
-import { computeNoteLeftPx, buildTempoMap, audioTimeToMs } from './player-utils.js';
+import { buildTempoMap, audioTimeToMs } from './player-utils.js';
 
 (function(){
   'use strict';
@@ -35,6 +35,8 @@ import { computeNoteLeftPx, buildTempoMap, audioTimeToMs } from './player-utils.
   let tempoEvents = [];          // mapa de tempo (segundos)
   const trackSettings = [];      // config de pista (solo volumen)
   let notePositions = {};        // cache de posiciones X por id
+  let timeline = [];             // { time: ms, left: px }
+  let timelineIndex = 0;         // índice para interpolar
   let isPlaying = false;         // reproduciendo
   let startAt = 0;               // ac.currentTime cuando inicia
   let prevNoteIds = new Set();   // notas resaltadas actuales
@@ -83,12 +85,22 @@ import { computeNoteLeftPx, buildTempoMap, audioTimeToMs } from './player-utils.
       const vb = svgEl.viewBox.baseVal;
       const pxPerUnit = svgEl.clientWidth / vb.width;
       for (const k in notePositions) delete notePositions[k];
+      const timeMap = new Map();
       svgEl.querySelectorAll('[id]').forEach(el => {
         try {
           const box = el.getBBox();
-          notePositions[el.id] = Math.round(box.x * pxPerUnit) + 16;
+          const id = el.id;
+          const left = Math.round(box.x * pxPerUnit) + 16;
+          notePositions[id] = left;
+          const ms = vrv.getTimeForElement(id);
+          if (ms >= 0) {
+            const prev = timeMap.get(ms);
+            if (prev == null || left < prev) timeMap.set(ms, left);
+          }
         } catch (_) {}
       });
+      timeline = Array.from(timeMap.entries()).map(([time, left]) => ({ time, left })).sort((a, b) => a.time - b.time);
+      timelineIndex = 0;
     }
   }
 
@@ -176,6 +188,14 @@ import { computeNoteLeftPx, buildTempoMap, audioTimeToMs } from './player-utils.
     prevNoteIds.clear();
   }
 
+  function resetTimeline(ms){
+    timelineIndex = 0;
+    if (!timeline.length) return;
+    while (timelineIndex < timeline.length - 1 && timeline[timelineIndex + 1].time <= ms) {
+      timelineIndex++;
+    }
+  }
+
   function stopMidi(){
     if (rafId) cancelAnimationFrame(rafId);
     if (ac){
@@ -185,6 +205,8 @@ import { computeNoteLeftPx, buildTempoMap, audioTimeToMs } from './player-utils.
     isPlaying = false; startAt = 0; timeInfo.textContent = '0.000 s';
     playBtn.textContent = '▶︎ Reproducir MIDI';
     clearHighlights();
+    playhead.style.left = '0px';
+    timelineIndex = 0;
   }
 
   // ===== Load score =====
@@ -240,16 +262,22 @@ import { computeNoteLeftPx, buildTempoMap, audioTimeToMs } from './player-utils.
         }
       });
       prevNoteIds = noteIds;
-      const noteId = elems && elems.notes && elems.notes[0];
-      if (noteId && svg) {
-        const leftPx = computeNoteLeftPx(noteId, svg, notePositions);
-        if (leftPx !== undefined) {
-          playhead.style.left = leftPx + 'px';
-          if (followChk.checked) {
-            const wrap = document.getElementById('score-wrap');
-            const want = Math.max(0, leftPx - wrap.clientWidth * 0.4);
-            if (Math.abs(want - wrap.scrollLeft) > 24) wrap.scrollLeft = want;
-          }
+      if (timeline.length) {
+        while (timelineIndex < timeline.length - 1 && t >= timeline[timelineIndex + 1].time) {
+          timelineIndex++;
+        }
+        const cur = timeline[timelineIndex];
+        const next = timeline[timelineIndex + 1];
+        let leftPx = cur.left;
+        if (next && next.time > cur.time) {
+          const frac = (t - cur.time) / (next.time - cur.time);
+          leftPx = cur.left + (next.left - cur.left) * frac;
+        }
+        playhead.style.left = leftPx + 'px';
+        if (followChk.checked) {
+          const wrap = document.getElementById('score-wrap');
+          const want = Math.max(0, leftPx - wrap.clientWidth * 0.4);
+          if (Math.abs(want - wrap.scrollLeft) > 24) wrap.scrollLeft = want;
         }
       }
       if ((ac.currentTime - startAt) >= ((midiDuration / tempoScale) + 0.5)) { stopMidi(); return; }
@@ -342,6 +370,7 @@ import { computeNoteLeftPx, buildTempoMap, audioTimeToMs } from './player-utils.
     try {
       startAt = ac.currentTime - ((tStart || 0) / tempoScale);
       isPlaying = true; playBtn.textContent = '⏸ Parar (MIDI)';
+      resetTimeline(audioTimeToMs(tempoEvents, tStart || 0));
       scheduleAll(ac, startAt);
       rafId = requestAnimationFrame(loop);
     } catch(e) {
