@@ -41,6 +41,7 @@ import { buildTempoMap, audioTimeToMs } from './player-utils.js';
   let startAt = 0;               // ac.currentTime cuando inicia
   let prevNoteIds = new Set();   // notas resaltadas actuales
   let tempoScale = 1;            // escala global de tempo (1 = 100%)
+  const SCHEDULE_AHEAD = 0.05;   // segundos que se programa el audio por anticipado
   // Generador de notas básico sin soundfont
   let preloadAc = null;          // AudioContext precargado
 
@@ -152,7 +153,6 @@ import { buildTempoMap, audioTimeToMs } from './player-utils.js';
 
   // Programación de notas usando osciladores básicos
   function scheduleAll(ctx, start){
-    const delay = 0.05; // s
     if (!midiObj || !midiObj.tracks) return;
     const offset = (ctx.currentTime - start) * tempoScale; // segundos ya reproducidos
     midiObj.tracks.forEach((t, i) => {
@@ -161,7 +161,7 @@ import { buildTempoMap, audioTimeToMs } from './player-utils.js';
       if (!t.notes) return;
       t.notes.forEach(n => {
         if (n.time < offset) return; // omitir notas previas
-        const when = ctx.currentTime + ((n.time - offset) / tempoScale) + delay;
+        const when = ctx.currentTime + ((n.time - offset) / tempoScale) + SCHEDULE_AHEAD;
         const dur = Math.max(0.04, n.duration / tempoScale);
         const vel = Math.max(0, Math.min(1, (n.velocity || 0.8) * vol));
         const midiNum = n.midi != null ? n.midi : 60;
@@ -241,7 +241,7 @@ import { buildTempoMap, audioTimeToMs } from './player-utils.js';
   function loop(){
     if (isPlaying && ac){
       const offsetMs = Number(offsetNum.value) || 0;
-      const curSec = (ac.currentTime - startAt) * tempoScale;
+      const curSec = Math.max(0, ac.currentTime - startAt - SCHEDULE_AHEAD) * tempoScale;
       const t = Math.max(0, audioTimeToMs(tempoEvents, curSec) + offsetMs);
       timeInfo.textContent = (t/1000).toFixed(3) + ' s';
       const elems = vrv.getElementsAtTime(Math.floor(t));
@@ -280,7 +280,7 @@ import { buildTempoMap, audioTimeToMs } from './player-utils.js';
           if (Math.abs(want - wrap.scrollLeft) > 24) wrap.scrollLeft = want;
         }
       }
-      if ((ac.currentTime - startAt) >= ((midiDuration / tempoScale) + 0.5)) { stopMidi(); return; }
+      if ((ac.currentTime - startAt - SCHEDULE_AHEAD) >= ((midiDuration / tempoScale) + 0.5)) { stopMidi(); return; }
       rafId = requestAnimationFrame(loop);
     }
   }
