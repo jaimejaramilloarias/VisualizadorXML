@@ -102,7 +102,9 @@ import { Midi } from "https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/+esm";
   let ac = null;                 // AudioContext
   let midiObj = null;            // @tonejs/midi
   let midiDuration = 0;          // segundos
+  let tempoEvents = [];          // mapa de tempo (segundos)
   const instruments = {};        // program -> soundfont instrument
+  let notePositions = {};        // cache de posiciones X por id
   let isPlaying = false;         // reproduciendo
   let startAt = 0;               // ac.currentTime cuando inicia
 
@@ -119,7 +121,8 @@ import { Midi } from "https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/+esm";
 
   function setOptionsForContainer(scalePct){
     if (!vrv) return;
-    const scale = Number(scalePct != null ? scalePct : zoomRange.value);
+    const pct = Number(scalePct != null ? scalePct : zoomRange.value);
+    const scale = Math.max(10, Math.round(40 * (pct / 100))); // 100% -> 40
     vrv.setOptions({
       breaks: 'none',           // tira horizontal
       svgViewBox: true,
@@ -140,6 +143,19 @@ import { Midi } from "https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/+esm";
     pageInfo.textContent = 'Pág. ' + page + '/' + (pageCount || '–');
     const wrap = document.getElementById('score-wrap');
     wrap.scrollLeft = 0;
+    // precomputar posiciones de notas para animación fluida
+    const svgEl = scoreEl.querySelector('svg');
+    if (svgEl) {
+      const vb = svgEl.viewBox.baseVal;
+      const pxPerUnit = svgEl.clientWidth / vb.width;
+      for (const k in notePositions) delete notePositions[k];
+      svgEl.querySelectorAll('[id]').forEach(el => {
+        try {
+          const box = el.getBBox();
+          notePositions[el.id] = Math.round(box.x * pxPerUnit) + 16;
+        } catch (_) {}
+      });
+    }
   }
 
   function b64ToArrayBuffer(b64){
@@ -192,6 +208,29 @@ import { Midi } from "https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/+esm";
   ];
   function programToName(p){ return GM_NAMES[p|0] || 'acoustic_grand_piano'; }
 
+  function buildTempoMap(m){
+    tempoEvents = [];
+    if (!m || !m.header || !m.header.tempos) return;
+    const tempos = m.header.tempos;
+    tempos.forEach(ev => {
+      const t = (ev.time != null) ? ev.time : (ev.ticks / m.header.ppq) * (60 / ev.bpm);
+      tempoEvents.push({ time: t, ms: t * 1000, bpm: ev.bpm });
+    });
+  }
+
+  function audioTimeToMs(sec){
+    if (!tempoEvents.length) return sec * 1000;
+    let prev = tempoEvents[0];
+    for (let i = 1; i < tempoEvents.length; i++) {
+      const next = tempoEvents[i];
+      if (sec < next.time) {
+        return prev.ms + (sec - prev.time) * 1000;
+      }
+      prev = next;
+    }
+    return prev.ms + (sec - prev.time) * 1000;
+  }
+
   async function ensureMidiParsed(){
     if (!vrv) throw new Error('Verovio no está listo');
     const b64 = vrv.renderToMIDI();
@@ -199,9 +238,9 @@ import { Midi } from "https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/+esm";
     const ab = a.buffer;
     if (typeof Midi.fromArrayBuffer === 'function') {
       const m = await Midi.fromArrayBuffer(ab);
-      midiObj = m; midiDuration = m.duration || 0; return;
+      midiObj = m; midiDuration = m.duration || 0; buildTempoMap(m); return;
     }
-    midiObj = new Midi(ab); midiDuration = midiObj.duration || 0;
+    midiObj = new Midi(ab); midiDuration = midiObj.duration || 0; buildTempoMap(midiObj);
   }
 
   function ensureInstruments(ctx){
@@ -220,7 +259,10 @@ import { Midi } from "https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/+esm";
       needed.forEach(p => {
         if (!instruments[p]) {
           const name = programToName(p);
-          tasks.push(window.Soundfont.instrument(ctx, name, { soundfont: 'FluidR3_GM' }).then(inst => { instruments[p] = inst; }));
+          const fonts = ['MusyngKite', 'FluidR3_GM'];
+          const load = (i) => window.Soundfont.instrument(ctx, name, { soundfont: fonts[i] })
+            .catch(() => (i + 1 < fonts.length) ? load(i + 1) : Promise.reject());
+          tasks.push(load(0).then(inst => { instruments[p] = inst; }));
         }
       });
       return Promise.all(tasks);
@@ -281,18 +323,25 @@ import { Midi } from "https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/+esm";
   function loop(){
     if (isPlaying && ac){
       const offsetMs = Number(offsetNum.value) || 0;
-      const t = Math.max(0, (ac.currentTime - startAt) * 1000 + offsetMs);
+      const curSec = ac.currentTime - startAt;
+      const t = Math.max(0, audioTimeToMs(curSec) + offsetMs);
       timeInfo.textContent = (t/1000).toFixed(3) + ' s';
       const elems = vrv.getElementsAtTime(Math.floor(t));
       if (elems && elems.page && elems.page !== page && followChk.checked) renderPage(elems.page);
       const svg = scoreEl.querySelector('svg');
       const noteId = elems && elems.notes && elems.notes[0];
       if (noteId && svg) {
-        const target = svg.getElementById(noteId);
-        if (target) {
-          const box = target.getBBox();
-          const vb = svg.viewBox.baseVal; const pxPerUnit = svg.clientWidth / vb.width;
-          const leftPx = Math.round(box.x * pxPerUnit) + 16;
+        let leftPx = notePositions[noteId];
+        if (leftPx === undefined) {
+          const target = svg.getElementById(noteId);
+          if (target) {
+            const box = target.getBBox();
+            const vb = svg.viewBox.baseVal; const pxPerUnit = svg.clientWidth / vb.width;
+            leftPx = Math.round(box.x * pxPerUnit) + 16;
+            notePositions[noteId] = leftPx;
+          }
+        }
+        if (leftPx !== undefined) {
           playhead.style.left = leftPx + 'px';
           if (followChk.checked) {
             const wrap = document.getElementById('score-wrap');
